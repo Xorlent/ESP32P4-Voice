@@ -158,8 +158,9 @@ bool runRowParallel(RowChunkFn fn, void* ctx, uint32_t nrows, size_t rowStride,
   return true;
 }
 
-bool enableDualCoreRows() {
+bool enableDualCoreRows(int workerCore) {
   if (g_worker != nullptr) return true;
+  if (workerCore < 0 || workerCore >= portNUM_PROCESSORS) workerCore = 1;
   if (g_staging == nullptr) {
     g_staging = static_cast<float*>(
         heap_caps_aligned_alloc(kLine, kStagingBytes, MALLOC_CAP_SPIRAM));
@@ -169,10 +170,10 @@ bool enableDualCoreRows() {
   g_go = xSemaphoreCreateBinary();
   g_done = xSemaphoreCreateBinary();
   if (g_go == nullptr || g_done == nullptr) return false;
-  // Worker on core 1; the inference task keeps its own core. 4 KB is ample for a
-  // row worker (a 256-entry decode scratch plus the PIE dot).
+  // Worker on the core the caller is not using. 4 KB is ample for a row worker
+  // (a 256-entry decode scratch plus the PIE dot).
   if (xTaskCreatePinnedToCore(workerTask, "cqrows", 4096, nullptr, 5, &g_worker,
-                              1) != pdPASS) {
+                              workerCore) != pdPASS) {
     g_worker = nullptr;
     return false;
   }
@@ -180,7 +181,7 @@ bool enableDualCoreRows() {
   g_cdone = xSemaphoreCreateBinary();
   if (g_cgo == nullptr || g_cdone == nullptr) return false;
   if (xTaskCreatePinnedToCore(chunkWorker, "cqchunks", 4096, nullptr, 5,
-                              &g_cworker, 1) != pdPASS) {
+                              &g_cworker, workerCore) != pdPASS) {
     g_cworker = nullptr;
     return false;
   }
@@ -194,7 +195,7 @@ bool enableDualCoreRows() {
 #else
 
 namespace whistle {
-bool enableDualCoreRows() { return false; }
+bool enableDualCoreRows(int) { return false; }
 bool runRowParallel(RowChunkFn, void*, uint32_t, size_t, float*, const void*,
                     size_t) {
   return false;

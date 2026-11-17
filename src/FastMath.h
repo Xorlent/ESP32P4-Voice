@@ -45,6 +45,15 @@ inline float expf(float x) {
 
 inline float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+// Round to nearest, ties to even. `nearbyintf` is an out-of-line libm call here,
+// and the quantizers use it once per element over buffers tens of thousands wide.
+// The magic add is the same rounding under the default FP mode, |v| < 2^22.
+inline float roundEven(float v) {
+  const float kMagic = 12582912.0f;  // 1.5 * 2^23
+  const float t = v + kMagic;
+  return t - kMagic;
+}
+
 inline float silu(float x) { return x * sigmoid(x); }
 
 }  // namespace fastmath

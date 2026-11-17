@@ -97,6 +97,13 @@ class Encoder {
     // Per-block buffers, allocated once; each is written before it is read.
     std::vector<float> b_hn, b_tmp, b_at, b_pw1, b_h, b_hconv, b_y, b_dw,
         b_nscale;
+    // Per-utterance staging, reused instead of rebuilt per transcribe; each is
+    // fully written before it is read.
+    std::vector<float> s0ring, s1, s2, flat, pwTmp, melbuf, stemOut;
+    std::vector<float> fw_stream, fw_seen, fw_nx, fw_hpre, fw_hpost, fw_hres,
+        fw_u, fw_y, fw_blk, fw_res, fw_kkmat, fw_next, fw_fx;
+    std::vector<int8_t> fw_nx8;
+    std::vector<float> fw_nx_scale;
   };
   Scratch scratch_;
 
@@ -120,6 +127,8 @@ class Encoder {
   struct MlpWeights {
     std::vector<float> d1, d2, b2, d3, d4;
     std::vector<float> w1a, w1b, w2a, w2b, w3a, w3b;
+    // Transposed factor matrices for the contiguous Kronecker applies.
+    std::vector<float> w1aT, w1bT, w2aT, w2bT, w3aT, w3bT;
     std::vector<float> cond_v, cond_u;
     uint32_t w1a0 = 0, w1a1 = 0, w1b0 = 0, w1b1 = 0;
     uint32_t w2a0 = 0, w2a1 = 0, w2b0 = 0, w2b1 = 0;
@@ -149,6 +158,9 @@ class Encoder {
     float* buf[2][3];
   };
   static void mlpJobImpl(void* ctx, uint32_t r0, uint32_t r1, float* out);
+
+  // Frees the length-scaling scratch; see the call at the end of encode().
+  void releaseScratch();
 
   mutable std::vector<int8_t> qScratch_;
   mutable std::vector<float> scaleScratch_;

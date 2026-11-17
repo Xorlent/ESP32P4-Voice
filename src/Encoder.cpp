@@ -35,6 +35,14 @@
 #define WHISTLE_STEM_OUT_INT8 1
 #endif
 
+// 1 = run the stem's two pointwise layers through the int8 CQ GEMV.
+// MEASURED WORSE for pw_1: 287 -> 449 ms (pw_2 alone 72 -> 59). These shapes have
+// out_count=128 against M=1216, so the GEMV writes y column-major (one cache line
+// per activation row) where the float path writes a contiguous 128-float block.
+#ifndef WHISTLE_STEM_PW_INT8
+#define WHISTLE_STEM_PW_INT8 0
+#endif
+
 namespace whistle {
 
 namespace {
@@ -61,7 +69,7 @@ void fakeQuantRows(float* x, size_t rows, size_t cols) {
     }
     const float scale = (amax > 0.0f) ? amax / qmax : 1.0f;
     for (size_t c = 0; c < cols; ++c) {
-      float v = std::nearbyintf(row[c] / scale);
+      float v = fastmath::roundEven(row[c] / scale);
       if (v < -128.0f) v = -128.0f;
       else if (v > 127.0f) v = 127.0f;
       row[c] = v * scale;
@@ -83,7 +91,7 @@ void fakeQuantQ8(const float* x, size_t rows, size_t cols, int8_t* q,
     scale[r] = s;
     int8_t* qr = q + r * cols;
     for (size_t c = 0; c < cols; ++c) {
-      float v = std::nearbyintf(xr[c] / s);
+      float v = fastmath::roundEven(xr[c] / s);
       if (v < -128.0f) v = -128.0f;
       else if (v > 127.0f) v = 127.0f;
       qr[c] = static_cast<int8_t>(v);
@@ -138,13 +146,13 @@ void matmulNT(const float* A, const float* B, float* C, size_t M, size_t N,
 // Position-blocked pointwise. NOTE: a version that put 8 positions in one
 // weight-row pass (short runtime-bound q loop, ab[] in memory) was 6x SLOWER on
 // this core - keep the simple per-position loop.
-void pointwiseRows(const float* w, float* buf, uint32_t npos, uint32_t st) {
+void pointwiseRows(const float* w, float* buf, uint32_t npos, uint32_t st,
+                   float* tmp) {
   // Block positions so the weight matrix (st*st floats) is streamed once per
   // block instead of once per position: at st=128 it is 64 KB re-read 1520 times
   // (~97 MB, measured at 379 ms for pointwise 1). Each output element still
   // accumulates k ascending, so the results are identical.
   const uint32_t kb = 32;
-  std::vector<float> tmp(static_cast<size_t>(kb) * st);
   for (uint32_t p0 = 0; p0 < npos; p0 += kb) {
     const uint32_t n = (npos - p0 < kb) ? (npos - p0) : kb;
     for (uint32_t o = 0; o < st; ++o) {
@@ -164,30 +172,57 @@ void pointwiseRows(const float* w, float* buf, uint32_t npos, uint32_t st) {
         tmp[static_cast<size_t>(p) * st + o] = acc;
       }
     }
-    std::memcpy(buf + static_cast<size_t>(p0) * st, tmp.data(),
+    std::memcpy(buf + static_cast<size_t>(p0) * st, tmp,
                 static_cast<size_t>(n) * st * sizeof(float));
   }
 }
 
-void kronApply(const float* z, size_t T, const float* a, uint32_t a0, uint32_t a1,
-               const float* b, uint32_t b0, uint32_t b1, float* out,
-               float* scratch) {
+// Contiguous dot of one row against n_out rows of B, four accumulators to break
+// the FPU dependency chain.
+void dotRows(const float* arow, const float* brow, float* dst, size_t n_out,
+             uint32_t k) {
+  for (size_t o = 0; o < n_out; ++o) {
+    const float* br = brow + o * k;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    uint32_t i = 0;
+    for (; i + 4 <= k; i += 4) {
+      a0 += arow[i] * br[i];
+      a1 += arow[i + 1] * br[i + 1];
+      a2 += arow[i + 2] * br[i + 2];
+      a3 += arow[i + 3] * br[i + 3];
+    }
+    float acc = (a0 + a1) + (a2 + a3);
+    for (; i < k; ++i) acc += arow[i] * br[i];
+    dst[o] = acc;
+  }
+}
+
+// Kronecker/"Monarch" apply used by the Hadamard MLP: out[k,l] = sum_{i,j}
+// z[i,j] * a[i,k] * b[j,l], for z (T, a0*b0) and out (T, a1*b1). With aT
+// (a1 x a0) and bT (b1 x b0) pre-transposed and the row of z transposed once,
+// both passes are contiguous dots; the naive form strides a cache line per tap.
+// Same products and per-dot order, only the four-way partial split differs.
+// `scratch` must hold a1*b0 + a0*b0 floats.
+void kronApply(const float* z, size_t T, const float* aT, uint32_t a0,
+               uint32_t a1, const float* bT, uint32_t b0, uint32_t b1,
+               float* out, float* scratch) {
+  float* tmpT = scratch;                                // (a1 x b0)
+  float* zT = scratch + static_cast<size_t>(a1) * b0;   // (b0 x a0)
   for (size_t t = 0; t < T; ++t) {
     const float* zt = z + t * (a0 * b0);
     float* ot = out + t * (a1 * b1);
-    float* tmp = scratch;
-    for (uint32_t j = 0; j < b0; ++j)
-      for (uint32_t k = 0; k < a1; ++k) {
-        float acc = 0.0f;
-        for (uint32_t i = 0; i < a0; ++i) acc += zt[i * b0 + j] * a[i * a1 + k];
-        tmp[j * a1 + k] = acc;
-      }
+    for (uint32_t i = 0; i < a0; ++i)
+      for (uint32_t j = 0; j < b0; ++j)
+        zT[static_cast<size_t>(j) * a0 + i] =
+            zt[static_cast<size_t>(i) * b0 + j];
+    // tmpT[k][j] = sum_i zT[j][i] * aT[k][i]  (operands swapped, same product)
     for (uint32_t k = 0; k < a1; ++k)
-      for (uint32_t l = 0; l < b1; ++l) {
-        float acc = 0.0f;
-        for (uint32_t j = 0; j < b0; ++j) acc += tmp[j * a1 + k] * b[j * b1 + l];
-        ot[k * b1 + l] = acc;
-      }
+      dotRows(aT + static_cast<size_t>(k) * a0, zT,
+              tmpT + static_cast<size_t>(k) * b0, b0, a0);
+    // ot[k][l] = sum_j tmpT[k][j] * bT[l][j]
+    for (uint32_t k = 0; k < a1; ++k)
+      dotRows(tmpT + static_cast<size_t>(k) * b0, bT,
+              ot + static_cast<size_t>(k) * b1, b1, b0);
   }
 }
 
@@ -219,6 +254,11 @@ uint32_t nextPow2(uint32_t n) {
   uint32_t p = 1;
   while (p < n) p <<= 1;
   return p;
+}
+
+template <typename T>
+void drop(std::vector<T>& v) {
+  std::vector<T>().swap(v);
 }
 
 }  // namespace
@@ -276,14 +316,19 @@ bool Encoder::prepare(const cactus::CactArchive& archive,
   stem_dw2_.resize(static_cast<size_t>(taps) * st);
   stem_pw1_.resize(static_cast<size_t>(st) * st);
   stem_pw2_.resize(static_cast<size_t>(st) * st);
+  // The int8 GEMV reads stem.out from the archive; only the float fallback needs
+  // the dequantized copy (2.6 MB).
+#if !WHISTLE_STEM_OUT_INT8
   const uint32_t stem_out_in = st * (mels / 8);
   stem_out_.resize(static_cast<size_t>(d) * stem_out_in);
+  if (!weights.readIndex(layout_.stem_out, stem_out_.data(), stem_out_.size()))
+    return false;
+#endif
   if (!weights.readIndex(layout_.stem_w, stem_w_.data(), stem_w_.size()) ||
       !weights.readIndex(layout_.stem_dw1, stem_dw1_.data(), stem_dw1_.size()) ||
       !weights.readIndex(layout_.stem_dw2, stem_dw2_.data(), stem_dw2_.size()) ||
       !weights.readIndex(layout_.stem_pw1, stem_pw1_.data(), stem_pw1_.size()) ||
-      !weights.readIndex(layout_.stem_pw2, stem_pw2_.data(), stem_pw2_.size()) ||
-      !weights.readIndex(layout_.stem_out, stem_out_.data(), stem_out_.size()))
+      !weights.readIndex(layout_.stem_pw2, stem_pw2_.data(), stem_pw2_.size()))
     return false;
 
   const uint32_t L = layout_.enc_layers;
@@ -354,40 +399,49 @@ bool Encoder::stem(const float* mel, size_t mel_frames, size_t valid_mel,
     if (progress_ != nullptr) progress_(progress_udata_, tag);
   };
 
-  // Stage 0: 1 -> stem channels, regular 3x3 stride 2.
-  std::vector<float> s0(static_cast<size_t>(t1) * f1 * st, 0.0f);
-  for (uint32_t t = 0; t < t1; ++t) {
-    if (t >= l1) continue;
-    const int64_t it0 = static_cast<int64_t>(t) * 2 - 1;
-    for (uint32_t f = 0; f < f1; ++f) {
-      const int64_t jf0 = static_cast<int64_t>(f) * 2 - 1;
-      float* dst = s0.data() + (static_cast<size_t>(t) * f1 + f) * st;
-      for (uint32_t oc = 0; oc < st; ++oc) dst[oc] = 0.0f;
-      for (uint32_t kh = 0; kh < ks; ++kh) {
-        const int64_t it = it0 + kh;
-        if (it < 0 || it >= static_cast<int64_t>(t0)) continue;
-        for (uint32_t kw = 0; kw < ks; ++kw) {
-          const int64_t jf = jf0 + kw;
-          if (jf < 0 || jf >= static_cast<int64_t>(f0)) continue;
-          const float x = mel[static_cast<size_t>(it) * f0 + jf];
-          const float* w = stem_w_.data() + (kh * ks + kw) * st;
-          for (uint32_t oc = 0; oc < st; ++oc) dst[oc] += x * w[oc];
+  // Stages 0 and 1 fused. Stage 1 reads only rows 2t-1..2t+1 of stage 0's
+  // output, so that output lives in a 4-row ring instead of the full
+  // [t1][f1][st] buffer (10 MB at 6 s, the largest allocation in the library).
+  constexpr uint32_t kRing = 4;
+  scratch_.s0ring.assign(static_cast<size_t>(kRing) * f1 * st, 0.0f);
+  auto& ring = scratch_.s0ring;
+  uint32_t s0Done = 0;
+  auto s0Row = [&](uint32_t r) {
+    return ring.data() + static_cast<size_t>(r & (kRing - 1)) * f1 * st;
+  };
+  auto makeS0 = [&](uint32_t upto) {
+    if (upto > t1) upto = t1;
+    while (s0Done < upto) {
+      const uint32_t t = s0Done++;
+      const int64_t it0 = static_cast<int64_t>(t) * 2 - 1;
+      for (uint32_t f = 0; f < f1; ++f) {
+        const int64_t jf0 = static_cast<int64_t>(f) * 2 - 1;
+        float* dst = s0Row(t) + static_cast<size_t>(f) * st;
+        for (uint32_t oc = 0; oc < st; ++oc) dst[oc] = 0.0f;
+        if (t >= l1) continue;  // padding rows stay zero
+        for (uint32_t kh = 0; kh < ks; ++kh) {
+          const int64_t it = it0 + kh;
+          if (it < 0 || it >= static_cast<int64_t>(t0)) continue;
+          for (uint32_t kw = 0; kw < ks; ++kw) {
+            const int64_t jf = jf0 + kw;
+            if (jf < 0 || jf >= static_cast<int64_t>(f0)) continue;
+            const float x = mel[static_cast<size_t>(it) * f0 + jf];
+            const float* w = stem_w_.data() + (kh * ks + kw) * st;
+            for (uint32_t oc = 0; oc < st; ++oc) dst[oc] += x * w[oc];
+          }
         }
+        // silu here so the 3x3 taps below never recompute one expf per tap.
+        for (uint32_t oc = 0; oc < st; ++oc) dst[oc] = silu(dst[oc]);
       }
     }
-  }
+  };
 
-  stg("st_s0");
-  // silu once per element: the 3x3 taps below read each source element up to
-  // nine times and would otherwise recompute silu (one expf) every time. s0 is
-  // not used after this stage.
-  for (size_t i = 0; i < s0.size(); ++i) s0[i] = silu(s0[i]);
-  stg("st_q0");
-
-  // Stage 1: silu -> depthwise 3x3 stride 2 -> pointwise.
-  std::vector<float> s1(static_cast<size_t>(t2) * f2 * st, 0.0f);
+  // Stage 1: depthwise 3x3 stride 2 -> pointwise.
+  scratch_.s1.assign(static_cast<size_t>(t2) * f2 * st, 0.0f);
+  auto& s1 = scratch_.s1;
   for (uint32_t t = 0; t < t2; ++t) {
     if (t >= l2) continue;
+    makeS0(2 * t + 2);
     const int64_t it0 = static_cast<int64_t>(t) * 2 - 1;
     for (uint32_t f = 0; f < f2; ++f) {
       const int64_t jf0 = static_cast<int64_t>(f) * 2 - 1;
@@ -400,7 +454,8 @@ bool Encoder::stem(const float* mel, size_t mel_frames, size_t valid_mel,
         for (uint32_t kw = 0; kw < ks; ++kw) {
           const int64_t jf = jf0 + kw;
           if (jf < 0 || jf >= static_cast<int64_t>(f1)) continue;
-          const float* src = s0.data() + (static_cast<size_t>(it) * f1 + jf) * st;
+          const float* src =
+              s0Row(static_cast<uint32_t>(it)) + static_cast<size_t>(jf) * st;
           const float* w = stem_dw1_.data() + (kh * ks + kw) * st;
           for (uint32_t c = 0; c < st; ++c) acc[c] += src[c] * w[c];
         }
@@ -408,14 +463,24 @@ bool Encoder::stem(const float* mel, size_t mel_frames, size_t valid_mel,
       std::memcpy(dst, acc, st * sizeof(float));
     }
   }
-  stg("st_s1");
-  pointwiseRows(stem_pw1_.data(), s1.data(), t2 * f2, st);
+  stg("st_s01");
+#if WHISTLE_STEM_PW_INT8
+  if (!dense(layout_.stem_pw1, s1.data(), static_cast<size_t>(t2) * f2, st, st,
+             s1.data()))
+    return false;
+#else
+  if (scratch_.pwTmp.size() < static_cast<size_t>(32) * st)
+    scratch_.pwTmp.assign(static_cast<size_t>(32) * st, 0.0f);
+  pointwiseRows(stem_pw1_.data(), s1.data(), t2 * f2, st,
+                scratch_.pwTmp.data());
+#endif
   stg("st_p1");
   for (size_t i = 0; i < s1.size(); ++i) s1[i] = silu(s1[i]);
   stg("st_q1");
 
   // Stage 2: silu -> depthwise 3x3 stride 2 -> pointwise.
-  std::vector<float> s2(static_cast<size_t>(t3) * f3 * st, 0.0f);
+  scratch_.s2.assign(static_cast<size_t>(t3) * f3 * st, 0.0f);
+  auto& s2 = scratch_.s2;
   for (uint32_t t = 0; t < t3; ++t) {
     if (t >= l3) continue;
     const int64_t it0 = static_cast<int64_t>(t) * 2 - 1;
@@ -439,12 +504,20 @@ bool Encoder::stem(const float* mel, size_t mel_frames, size_t valid_mel,
     }
   }
   stg("st_s2");
-  pointwiseRows(stem_pw2_.data(), s2.data(), t3 * f3, st);
+#if WHISTLE_STEM_PW_INT8
+  if (!dense(layout_.stem_pw2, s2.data(), static_cast<size_t>(t3) * f3, st, st,
+             s2.data()))
+    return false;
+#else
+  pointwiseRows(stem_pw2_.data(), s2.data(), t3 * f3, st,
+                scratch_.pwTmp.data());
+#endif
   stg("st_p2");
 
   // silu, swap channel/frequency to [T][C][F], flatten C*F per frame.
   const uint32_t flat_in = st * f3;
-  std::vector<float> flat(static_cast<size_t>(t3) * flat_in, 0.0f);
+  scratch_.flat.assign(static_cast<size_t>(t3) * flat_in, 0.0f);
+  auto& flat = scratch_.flat;
   for (uint32_t t = 0; t < t3; ++t)
     for (uint32_t c = 0; c < st; ++c)
       for (uint32_t f = 0; f < f3; ++f) {
@@ -475,26 +548,70 @@ bool Encoder::stemDebug(const float* mel, size_t mel_frames, size_t valid_mel,
   return stem(mel, mel_frames, valid_mel, out, out_frames, valid_out);
 }
 
+void Encoder::releaseScratch() {
+  drop(scratch_.s0ring);
+  drop(scratch_.s1);
+  drop(scratch_.s2);
+  drop(scratch_.flat);
+  drop(scratch_.pwTmp);
+  drop(scratch_.melbuf);
+  drop(scratch_.stemOut);
+  drop(scratch_.fw_stream);
+  drop(scratch_.fw_seen);
+  drop(scratch_.fw_nx);
+  drop(scratch_.fw_nx8);
+  drop(scratch_.fw_nx_scale);
+  drop(scratch_.fw_hpre);
+  drop(scratch_.fw_hpost);
+  drop(scratch_.fw_hres);
+  drop(scratch_.fw_u);
+  drop(scratch_.fw_y);
+  drop(scratch_.fw_blk);
+  drop(scratch_.fw_res);
+  drop(scratch_.fw_kkmat);
+  drop(scratch_.fw_next);
+  drop(scratch_.fw_fx);
+  drop(scratch_.b_hn);
+  drop(scratch_.b_tmp);
+  drop(scratch_.b_at);
+  drop(scratch_.b_pw1);
+  drop(scratch_.b_h);
+  drop(scratch_.b_hconv);
+  drop(scratch_.b_y);
+  drop(scratch_.xq);
+  drop(scratch_.q);
+  drop(scratch_.k);
+  drop(scratch_.v);
+  drop(scratch_.gate);
+  drop(scratch_.satmp);
+  drop(scratch_.attn);
+  drop(scratch_.scores);
+}
+
 bool Encoder::encode(const float* pcm, size_t num_samples,
                      std::vector<float>* mem, size_t* frames) {
   if (!ready_ || pcm == nullptr || mem == nullptr || frames == nullptr)
     return false;
   const size_t mel_frames = mel_.frames(num_samples);
   const size_t valid_mel = mel_.validFrames(num_samples);
-  std::vector<float> melbuf(mel_frames * layout_.mels);
+  scratch_.melbuf.assign(mel_frames * layout_.mels, 0.0f);
+  auto& melbuf = scratch_.melbuf;
   mel_.setProgress(progress_, progress_udata_);
   mel_.compute(pcm, num_samples, melbuf.data());
   if (progress_) progress_(progress_udata_, "mel");
 
-  std::vector<float> stem_out;
   size_t stem_frames = 0, valid_stem = 0;
-  if (!stem(melbuf.data(), mel_frames, valid_mel, &stem_out, &stem_frames,
-            &valid_stem))
+  if (!stem(melbuf.data(), mel_frames, valid_mel, &scratch_.stemOut,
+            &stem_frames, &valid_stem))
     return false;
   if (progress_) progress_(progress_udata_, "stem");
 
-  encoderForward(stem_out.data(), stem_frames, valid_stem, mem);
+  encoderForward(scratch_.stemOut.data(), stem_frames, valid_stem, mem);
   *frames = valid_stem;
+  // The decoder runs next and needs its own cross-attention workspace; holding
+  // the encoder's length-scaling scratch through it is what capped the clip
+  // length. Everything dropped here is re-assigned at the top of the next call.
+  releaseScratch();
   return true;
 }
 
@@ -506,21 +623,41 @@ void Encoder::encoderForward(const float* x, size_t frames, size_t valid,
   const uint32_t nC = n * d;
   const size_t T = frames + (frames & 1);  // encode() pads time to even
 
-  std::vector<float> stream(T * n * d, 0.0f);
+  scratch_.fw_stream.assign(T * n * d, 0.0f);
+  auto& stream = scratch_.fw_stream;
   for (size_t t = 0; t < frames; ++t)
     for (uint32_t i = 0; i < n; ++i)
       for (uint32_t c = 0; c < d; ++c)
         stream[(t * n + i) * d + c] = x[t * d + c];
 
-  std::vector<float> seen(T, 0.0f);
+  scratch_.fw_seen.assign(T, 0.0f);
+  auto& seen = scratch_.fw_seen;
   for (size_t t = 0; t < valid && t < T; ++t) seen[t] = 1.0f;
 
-  std::vector<float> nx(T * nC, 0.0f), hpre(T * n, 0.0f), hpost(T * n, 0.0f);
-  std::vector<int8_t> nx8(T * nC, 0);
-  std::vector<float> nx_scale(T, 0.0f);
-  std::vector<float> hres(T * n * n, 0.0f), u(T * d, 0.0f), y(T * d, 0.0f);
-  std::vector<float> blk(T * d, 0.0f), res(T * n * n, 0.0f);
-  std::vector<float> kkmat(n * n, 0.0f), next(T * n * d, 0.0f);
+  scratch_.fw_nx.assign(T * nC, 0.0f);
+  scratch_.fw_hpre.assign(T * n, 0.0f);
+  scratch_.fw_hpost.assign(T * n, 0.0f);
+  scratch_.fw_nx8.assign(T * nC, 0);
+  scratch_.fw_nx_scale.assign(T, 0.0f);
+  scratch_.fw_hres.assign(T * n * n, 0.0f);
+  scratch_.fw_u.assign(T * d, 0.0f);
+  scratch_.fw_y.assign(T * d, 0.0f);
+  scratch_.fw_blk.assign(T * d, 0.0f);
+  scratch_.fw_res.assign(T * n * n, 0.0f);
+  scratch_.fw_kkmat.assign(n * n, 0.0f);
+  scratch_.fw_next.assign(T * n * d, 0.0f);
+  auto& nx = scratch_.fw_nx;
+  auto& hpre = scratch_.fw_hpre;
+  auto& hpost = scratch_.fw_hpost;
+  auto& nx8 = scratch_.fw_nx8;
+  auto& nx_scale = scratch_.fw_nx_scale;
+  auto& hres = scratch_.fw_hres;
+  auto& u = scratch_.fw_u;
+  auto& y = scratch_.fw_y;
+  auto& blk = scratch_.fw_blk;
+  auto& res = scratch_.fw_res;
+  auto& kkmat = scratch_.fw_kkmat;
+  auto& next = scratch_.fw_next;
 
   for (uint32_t layer = 0; layer < L; ++layer) {
     rmsNormRows(stream.data(), T, nC, nullptr, nx.data());
@@ -599,7 +736,8 @@ void Encoder::encoderForward(const float* x, size_t frames, size_t valid,
     }
   }
 
-  std::vector<float> fx(T * d, 0.0f);
+  scratch_.fw_fx.assign(T * d, 0.0f);
+  auto& fx = scratch_.fw_fx;
   for (size_t t = 0; t < T; ++t)
     for (uint32_t c = 0; c < d; ++c) {
       float acc = 0.0f;
@@ -947,6 +1085,21 @@ bool Encoder::ensureMlpWeights(uint32_t layer, uint32_t which) {
       !weights_->readIndex(base + 11, mw.cond_v.data(), mw.cond_v.size()) ||
       !weights_->readIndex(base + 12, mw.cond_u.data(), mw.cond_u.size()))
     return false;
+  // Transposed copies for the contiguous Kronecker applies.
+  auto transpose = [](const float* src, uint32_t rows, uint32_t cols,
+                      std::vector<float>& dst) {
+    dst.resize(static_cast<size_t>(rows) * cols);
+    for (uint32_t i = 0; i < rows; ++i)
+      for (uint32_t j = 0; j < cols; ++j)
+        dst[static_cast<size_t>(j) * rows + i] =
+            src[static_cast<size_t>(i) * cols + j];
+  };
+  transpose(mw.w1a.data(), mw.w1a0, mw.w1a1, mw.w1aT);
+  transpose(mw.w1b.data(), mw.w1b0, mw.w1b1, mw.w1bT);
+  transpose(mw.w2a.data(), mw.w2a0, mw.w2a1, mw.w2aT);
+  transpose(mw.w2b.data(), mw.w2b0, mw.w2b1, mw.w2bT);
+  transpose(mw.w3a.data(), mw.w3a0, mw.w3a1, mw.w3aT);
+  transpose(mw.w3b.data(), mw.w3b0, mw.w3b1, mw.w3bT);
   mw.loaded = true;
   return true;
 }
@@ -972,12 +1125,12 @@ void Encoder::mlpTiles(const MlpWeights& mw, const float* x, size_t r0, size_t r
   const size_t nb2 = static_cast<size_t>(mw.w2b0) * mw.w2b1;
   const size_t na3 = static_cast<size_t>(mw.w3a0) * mw.w3a1;
   const size_t nb3 = static_cast<size_t>(mw.w3b0) * mw.w3b1;
-  std::memcpy(kronW, mw.w1a.data(), na1 * sizeof(float));
-  std::memcpy(kronW + na1, mw.w1b.data(), nb1 * sizeof(float));
-  std::memcpy(kronW + na1 + nb1, mw.w2a.data(), na2 * sizeof(float));
-  std::memcpy(kronW + na1 + nb1 + na2, mw.w2b.data(), nb2 * sizeof(float));
-  std::memcpy(kronW + na1 + nb1 + na2 + nb2, mw.w3a.data(), na3 * sizeof(float));
-  std::memcpy(kronW + na1 + nb1 + na2 + nb2 + na3, mw.w3b.data(),
+  std::memcpy(kronW, mw.w1aT.data(), na1 * sizeof(float));
+  std::memcpy(kronW + na1, mw.w1bT.data(), nb1 * sizeof(float));
+  std::memcpy(kronW + na1 + nb1, mw.w2aT.data(), na2 * sizeof(float));
+  std::memcpy(kronW + na1 + nb1 + na2, mw.w2bT.data(), nb2 * sizeof(float));
+  std::memcpy(kronW + na1 + nb1 + na2 + nb2, mw.w3aT.data(), na3 * sizeof(float));
+  std::memcpy(kronW + na1 + nb1 + na2 + nb2 + na3, mw.w3bT.data(),
               nb3 * sizeof(float));
   const float* const k1a = kronW;
   const float* const k1b = k1a + na1;
@@ -1105,42 +1258,11 @@ void Encoder::hadamardMlp(const float* x, size_t T, uint32_t layer,
   const uint32_t w3b0 = m3b->shape[0], w3b1 = m3b->shape[1];
   if (w1a0 * w1b0 != nn || w2a0 * w2b0 != nn || w3a0 * w3b0 != nn) return;
 
-  // These tensors are constant, so they are read once and kept: re-reading them
-  // (and re-allocating the buffers) cost 115 ms per call, 16 calls per
-  // utterance.
+  // prepare() loads every (layer, half) eagerly; this fallback must go through
+  // ensureMlpWeights so the transposed factor copies are built too.
   const size_t mi = static_cast<size_t>(layer) * 2 + which;
-  if (mlpW_.size() <= mi) mlpW_.resize(static_cast<size_t>(layout_.enc_layers) * 2);
+  if (!ensureMlpWeights(layer, which)) return;
   MlpWeights& mw = mlpW_[mi];
-  if (!mw.loaded) {
-    mw.d1.resize(nn);
-    mw.d2.resize(nn);
-    mw.b2.resize(nn);
-    mw.d3.resize(nn);
-    mw.d4.resize(nn);
-    mw.w1a.resize(w1a0 * w1a1);
-    mw.w1b.resize(w1b0 * w1b1);
-    mw.w2a.resize(w2a0 * w2a1);
-    mw.w2b.resize(w2b0 * w2b1);
-    mw.w3a.resize(w3a0 * w3a1);
-    mw.w3b.resize(w3b0 * w3b1);
-    mw.cond_v.resize(static_cast<size_t>(d) * 8);
-    mw.cond_u.resize(static_cast<size_t>(8) * nn);
-    if (!weights_->readIndex(base + 0, mw.d1.data(), nn) ||
-        !weights_->readIndex(base + 1, mw.d2.data(), nn) ||
-        !weights_->readIndex(base + 2, mw.b2.data(), nn) ||
-        !weights_->readIndex(base + 3, mw.d3.data(), nn) ||
-        !weights_->readIndex(base + 4, mw.d4.data(), nn) ||
-        !weights_->readIndex(base + 5, mw.w1a.data(), mw.w1a.size()) ||
-        !weights_->readIndex(base + 6, mw.w1b.data(), mw.w1b.size()) ||
-        !weights_->readIndex(base + 7, mw.w2a.data(), mw.w2a.size()) ||
-        !weights_->readIndex(base + 8, mw.w2b.data(), mw.w2b.size()) ||
-        !weights_->readIndex(base + 9, mw.w3a.data(), mw.w3a.size()) ||
-        !weights_->readIndex(base + 10, mw.w3b.data(), mw.w3b.size()) ||
-        !weights_->readIndex(base + 11, mw.cond_v.data(), mw.cond_v.size()) ||
-        !weights_->readIndex(base + 12, mw.cond_u.data(), mw.cond_u.size()))
-      return;
-    mw.loaded = true;
-  }
   // Process time in tiles so the MLP working set (xc/cond/z/ztmp) stays in
   // cache: at T=37 the three nn-wide buffers are 76 KB each, and their placement
   // alone moved this stage between 320 and 825 ms per call. Rows are
@@ -1161,10 +1283,12 @@ void Encoder::hadamardMlp(const float* x, size_t T, uint32_t layer,
     if (scratch_.mlpTmp.size() < need) scratch_.mlpTmp.assign(need, 0.0f);
     if (scratch_.mlpTmp2.size() < need) scratch_.mlpTmp2.assign(need, 0.0f);
   }
+  // a1*b0 transposed intermediates plus a0*b0 transposed row.
   const size_t kscratch_need =
       std::max(static_cast<size_t>(w1b0) * w1a1,
                std::max(static_cast<size_t>(w2b0) * w2a1,
-                        static_cast<size_t>(w3b0) * w3a1));
+                        static_cast<size_t>(w3b0) * w3a1)) +
+      static_cast<size_t>(nn);
   if (scratch_.kronTmp.size() < kscratch_need)
     scratch_.kronTmp.assign(kscratch_need, 0.0f);
   if (scratch_.kronTmp2.size() < kscratch_need)

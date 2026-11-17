@@ -13,63 +13,6 @@
 namespace whistle {
 namespace kernels {
 
-// Signed int8 dot (n multiple of 16). Unrolled 8 chunks with loads issued four
-// chunks ahead of the VMULAS that consume them, so the serial XACC chain hides
-// the load latency; the accumulate order is unchanged, so the sum is exact.
-int32_t dot_s8(const int8_t* a, const int8_t* b, size_t n) {
-  int64_t result = 0;
-  int64_t* out = &result;
-  const size_t chunks = n >> 4;
-  const size_t octs = chunks >> 3;
-  const size_t rem = chunks & 7;
-  asm volatile(
-    "ESP.ZERO.XACC                  \n\t"
-    "mv    t0, %[octs]              \n\t"
-    "beqz  t0, 3f                   \n\t"
-    "1:                             \n\t"
-    "ESP.VLD.128.IP q0, %[a], 16    \n\t"
-    "ESP.VLD.128.IP q1, %[b], 16    \n\t"
-    "ESP.VLD.128.IP q2, %[a], 16    \n\t"
-    "ESP.VLD.128.IP q3, %[b], 16    \n\t"
-    "ESP.VMULAS.S8.XACC q0, q1      \n\t"
-    "ESP.VLD.128.IP q4, %[a], 16    \n\t"
-    "ESP.VLD.128.IP q5, %[b], 16    \n\t"
-    "ESP.VMULAS.S8.XACC q2, q3      \n\t"
-    "ESP.VLD.128.IP q6, %[a], 16    \n\t"
-    "ESP.VLD.128.IP q7, %[b], 16    \n\t"
-    "ESP.VMULAS.S8.XACC q4, q5      \n\t"
-    "ESP.VLD.128.IP q0, %[a], 16    \n\t"
-    "ESP.VLD.128.IP q1, %[b], 16    \n\t"
-    "ESP.VMULAS.S8.XACC q6, q7      \n\t"
-    "ESP.VLD.128.IP q2, %[a], 16    \n\t"
-    "ESP.VLD.128.IP q3, %[b], 16    \n\t"
-    "ESP.VMULAS.S8.XACC q0, q1      \n\t"
-    "ESP.VLD.128.IP q4, %[a], 16    \n\t"
-    "ESP.VLD.128.IP q5, %[b], 16    \n\t"
-    "ESP.VMULAS.S8.XACC q2, q3      \n\t"
-    "ESP.VLD.128.IP q6, %[a], 16    \n\t"
-    "ESP.VLD.128.IP q7, %[b], 16    \n\t"
-    "ESP.VMULAS.S8.XACC q4, q5      \n\t"
-    "ESP.VMULAS.S8.XACC q6, q7      \n\t"
-    "addi  t0, t0, -1               \n\t"
-    "bnez  t0, 1b                   \n\t"
-    "3:                             \n\t"
-    "mv    t0, %[rem]               \n\t"
-    "2:                             \n\t"
-    "beqz  t0, 4f                   \n\t"
-    "ESP.VLD.128.IP q0, %[a], 16    \n\t"
-    "ESP.VLD.128.IP q1, %[b], 16    \n\t"
-    "ESP.VMULAS.S8.XACC q0, q1      \n\t"
-    "addi  t0, t0, -1               \n\t"
-    "bnez  t0, 2b                   \n\t"
-    "4:                             \n\t"
-    "ESP.ST.S.XACC.IP %[out], 0     \n\t"
-    : [a] "+r"(a), [b] "+r"(b)
-    : [octs] "r"(octs), [rem] "r"(rem), [out] "r"(out)
-    : "t0", "memory");
-  return static_cast<int32_t>(result);
-}
-
 // Signed 16-bit dot (n multiple of 8). Unrolled 4 chunks so the 8 loads issue
 // ahead of the 4 serialized VMULAS.S16.XACC, hiding load latency on the short
 // 128-element dots that dominate the CQ GEMV.

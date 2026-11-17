@@ -208,6 +208,9 @@ void MelSpectrogram::compute(const float* pcm, size_t num_samples, float* mel) {
   for (size_t t = valid; t < total; ++t)
     for (size_t m = 0; m < mels; ++m) mel[t * mels + m] = 0.0f;
   if (progress_ != nullptr) progress_(progress_udata_, "mel_norm");
+  // Both are pure scratch and the stem is the memory peak that follows.
+  std::vector<float>().swap(powers_);
+  std::vector<float>().swap(raw_);
 }
 
 }  // namespace whistle

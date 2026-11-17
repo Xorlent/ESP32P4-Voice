@@ -91,7 +91,7 @@ void fakeQuantRows(float* x, size_t rows, size_t cols) {
     }
     const float scale = (amax > 0.0f) ? amax / qmax : 1.0f;
     for (size_t c = 0; c < cols; ++c) {
-      float v = std::nearbyintf(row[c] / scale);
+      float v = fastmath::roundEven(row[c] / scale);
       if (v < -128.0f) v = -128.0f;
       else if (v > 127.0f) v = 127.0f;
       row[c] = v * scale;
@@ -115,7 +115,7 @@ void fakeQuantQ8(const float* x, size_t rows, size_t cols, int8_t* q, float* sca
     scale[r] = s;
     int8_t* qrow = q + r * cols;
     for (size_t c = 0; c < cols; ++c) {
-      float v = std::nearbyintf(xr[c] / s);
+      float v = fastmath::roundEven(xr[c] / s);
       if (v < -128.0f) v = -128.0f;
       else if (v > 127.0f) v = 127.0f;
       qrow[c] = static_cast<int8_t>(v);

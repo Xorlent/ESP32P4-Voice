@@ -71,9 +71,10 @@ struct VoiceConfig {
   // Silence (ms) that ends the utterance after a wake-word trigger.
   uint32_t silence_ms = 800;
 
-  // Speech decoder ladder depth: 0 = full (8), otherwise 2..8. Rungs select
-  // blocks in ladder order (both endpoints, bisected interiors), so depth 4 runs
-  // blocks 0,3,5,7. Shallower is faster with some accuracy loss.
+  // Speech decoder ladder depth: 0 = full (8 blocks), otherwise 2..8. Rungs are
+  // trained sub-networks selected in ladder order, so depth 4 runs blocks
+  // 0,3,5,7. Lower is faster at some accuracy cost: depth 4 measured 8.1 -> 6.7 s
+  // on the 3 s probe. Validate it on your own commands before shipping.
   uint32_t decoder_depth = 0;
 
   // Hard cap on generated transcript tokens (the decoder still stops at eos).

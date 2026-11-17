@@ -9,6 +9,7 @@
 
 #include "MicInput.h"
 #include "ModelTransport.h"
+#include "RowParallel.h"
 #include "WhistleEngine.h"
 #include "psram.h"
 
@@ -50,6 +51,9 @@ bool WhistleVoice::begin(const VoiceConfig& cfg) {
   }
   Impl& im = *impl_;
   im.cfg = cfg;
+
+  // Inference runs in loop(), so the row worker takes the other core.
+  enableDualCoreRows(xPortGetCoreID() == 0 ? 1 : 0);
 
   // PTT GPIO: configure the resting pull automatically. Active-high logic rests
   // low (pulled HIGH to talk -> needs a pull-down so an open button reads idle);

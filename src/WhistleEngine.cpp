@@ -5,6 +5,8 @@
 #include <cstring>
 #include <cstdio>
 
+#include "FastMath.h"
+
 
 
 namespace whistle {
@@ -21,7 +23,7 @@ void fakeQuantRows(float* x, size_t rows, size_t cols) {
     }
     const float scale = (amax > 0.0f) ? amax / qmax : 1.0f;
     for (size_t c = 0; c < cols; ++c) {
-      float v = std::nearbyintf(row[c] / scale);
+      float v = fastmath::roundEven(row[c] / scale);
       if (v < -128.0f) v = -128.0f;
       else if (v > 127.0f) v = 127.0f;
       row[c] = v * scale;

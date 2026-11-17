@@ -23,6 +23,15 @@ namespace whistle {
 #define WHISTLE_CQ_FUSE_M1 0
 #endif
 
+// 1 = walk output rows outer / weight groups inner for the int8 path. With 2-bit
+// weights a 512-wide row is 128 B = two cache lines, and the group-outer walk
+// re-reads each row's first line for group 1 (8199 rows do not fit L1): twice the
+// cold PSRAM misses. Row-outer reads each line once and updates y once per row.
+// Same dots in the same order, so identical results.
+#ifndef WHISTLE_CQ_ROW_OUTER
+#define WHISTLE_CQ_ROW_OUTER 1
+#endif
+
 ModelWeights::RowsHook ModelWeights::rowsHook_ = nullptr;
 size_t ModelWeights::rowsStaging_ = 0;
 
@@ -211,6 +220,64 @@ void cq8RowsImpl(void* vp, uint32_t r0, uint32_t r1, float* out,
       out[mm * outStride + (r - r0)] +=
           norm * c.inv_sw * c.sx[mm] * static_cast<float>(d);
     }
+  }
+}
+
+// ---- int8 row worker, row-outer ----
+// Row-outer counterpart of cq8RowsImpl; xq/sx cover all groups (see the
+// WHISTLE_CQ_ROW_OUTER note above).
+struct Cq8RowOuterCtx {
+  const uint8_t* blob;
+  const int8_t* xq;
+  const float* sx;
+  const uint32_t* tab2;
+  const uint16_t* tab4;
+  int8_t* wb[2];
+  size_t idx_bytes;
+  size_t row_pack;
+  size_t group_pack;
+  size_t M;
+  uint32_t out_begin;
+  uint32_t out_count;
+  uint32_t groups;
+  uint32_t group;
+  uint32_t in_pad;
+  uint32_t bits;
+  float inv_sw;
+};
+
+void cq8RowsOuterImpl(void* vp, uint32_t r0, uint32_t r1, float* out,
+                      size_t outStride) {
+  const Cq8RowOuterCtx& c = *static_cast<const Cq8RowOuterCtx*>(vp);
+  int8_t* wq = c.wb[r0 == 0 ? 0 : 1];
+  float acc[96];  // M <= 96 (5 s of audio is T = 63)
+  for (uint32_t r = r0; r < r1; ++r) {
+    const size_t row = static_cast<size_t>(c.out_begin + r);
+    const uint8_t* rbase = c.blob + row * c.row_pack;
+    const uint8_t* rnorm = c.blob + c.idx_bytes + row * c.groups * 2;
+    for (size_t mm = 0; mm < c.M; ++mm) acc[mm] = 0.0f;
+    for (uint32_t g = 0; g < c.groups; ++g) {
+      const float norm = fp16ToF32(rd_u16(rnorm + g * 2));
+      const uint8_t* gidx = rbase + static_cast<size_t>(g) * c.group_pack;
+      if (c.bits == 2) {
+        const uint32_t nbytes = c.group >> 2;
+        for (uint32_t b = 0; b < nbytes; ++b)
+          reinterpret_cast<uint32_t*>(wq + 4 * b)[0] = c.tab2[gidx[b]];
+      } else {
+        const uint32_t nbytes = c.group >> 1;
+        for (uint32_t b = 0; b < nbytes; ++b)
+          reinterpret_cast<uint16_t*>(wq + 2 * b)[0] = c.tab4[gidx[b]];
+      }
+      const size_t gbase = static_cast<size_t>(g) * c.group;
+      for (size_t mm = 0; mm < c.M; ++mm) {
+        const int32_t d =
+            kernels::dot_s8(wq, c.xq + mm * c.in_pad + gbase, c.group);
+        acc[mm] += norm * c.inv_sw * c.sx[mm * c.groups + g] *
+                   static_cast<float>(d);
+      }
+    }
+    for (size_t mm = 0; mm < c.M; ++mm)
+      out[mm * outStride + (r - r0)] += acc[mm];
   }
 }
 
@@ -626,14 +693,23 @@ bool ModelWeights::gemvCqInt8Meta(const cactus::TensorMeta* m,
   int8_t* q8All = nullptr;
   float* sx8 = nullptr;
   if (i8path) {
-    const size_t q_need_raw = M * group + 16;
+#if WHISTLE_CQ_ROW_OUTER
+    const bool rowOuter = M <= 96;
+    const size_t q_need_raw =
+        (rowOuter ? static_cast<size_t>(M) * in_pad
+                  : static_cast<size_t>(M) * group) + 16;
+    const size_t sx_need = rowOuter ? static_cast<size_t>(M) * groups : M;
+#else
+    const size_t q_need_raw = static_cast<size_t>(M) * group + 16;
+    const size_t sx_need = M;
+#endif
     // Read once per (row, group, activation row) - i.e. hundreds of times per
     // output row. Requests <= 16 KB land in internal SRAM, which is uncached
     // here; staging the same pattern into a fresh PSRAM buffer was worth 13x on
     // kronApply (1608 -> 105 ms), so keep this above the threshold.
     const size_t q8_need = q_need_raw > 20 * 1024 ? q_need_raw : 20 * 1024;
     if (q8Scratch_.size() < q8_need) q8Scratch_.resize(q8_need);
-    if (sxScratch_.size() < M) sxScratch_.resize(M);
+    if (sxScratch_.size() < sx_need) sxScratch_.resize(sx_need, 1.0f);
     q8All = reinterpret_cast<int8_t*>(
         (reinterpret_cast<uintptr_t>(q8Scratch_.data()) + 15u) & ~uintptr_t(15u));
     sx8 = sxScratch_.data();
@@ -736,6 +812,86 @@ bool ModelWeights::gemvCqInt8Meta(const cactus::TensorMeta* m,
     for (uint32_t o = 0; o < out_count; ++o) y[o] *= s0;
     return true;
   }
+
+#if WHISTLE_CQ_ROW_OUTER
+  // ---- row-outer int8 path (see WHISTLE_CQ_ROW_OUTER) ----
+  if (i8path && M <= 96) {
+    for (uint32_t g = 0; g < groups; ++g) {
+      const size_t src = static_cast<size_t>(g) * group;
+      for (size_t mm = 0; mm < M; ++mm) {
+        const int8_t* qrow = q + mm * in;
+        int16_t* fg = fwAll + mm * group;
+        if (src + group <= in) {
+          for (uint32_t k = 0; k < group; ++k)
+            fg[k] = static_cast<int16_t>(qrow[src + k]);
+        } else {
+          const size_t avail = (in > src) ? (in - src) : 0;
+          for (size_t k = 0; k < avail; ++k)
+            fg[k] = static_cast<int16_t>(qrow[src + k]);
+          for (uint32_t k = static_cast<uint32_t>(avail); k < group; ++k)
+            fg[k] = 0;
+        }
+        kernels::fwht_s16(fg, group);
+        int32_t amax = 0;
+        for (uint32_t k = 0; k < group; ++k) {
+          const int32_t v = fg[k] < 0 ? -fg[k] : fg[k];
+          if (v > amax) amax = v;
+        }
+        const float s = amax > 0 ? static_cast<float>(amax) / 127.0f : 1.0f;
+        const float inv = 1.0f / s;
+        int8_t* xd = q8All + mm * in_pad + src;
+        for (uint32_t k = 0; k < group; ++k)
+          xd[k] = q8i(static_cast<float>(fg[k]) * inv);
+        sx8[mm * groups + g] = s;
+      }
+    }
+    fire("fwht");
+
+    Cq8RowOuterCtx c8;
+    c8.blob = blob;
+    c8.xq = q8All;
+    c8.sx = sx8;
+    c8.tab2 = lut2_8_;
+    c8.tab4 = lut4_8_;
+    c8.idx_bytes = idx_bytes;
+    c8.row_pack = row_pack;
+    c8.group_pack = group_pack;
+    c8.M = M;
+    c8.out_begin = out_begin;
+    c8.out_count = out_count;
+    c8.groups = groups;
+    c8.group = group;
+    c8.in_pad = in_pad;
+    c8.bits = bits;
+    c8.inv_sw = cb8Inv_[bits == 2 ? 0 : 2];
+    for (int wbi = 0; wbi < 2; ++wbi) {
+      if (wqRow_[wbi].size() < 20 * 1024)
+        wqRow_[wbi].assign(20 * 1024, 0);
+      c8.wb[wbi] = reinterpret_cast<int8_t*>(
+          (reinterpret_cast<uintptr_t>(wqRow_[wbi].data()) + 15u) &
+          ~uintptr_t(15u));
+    }
+    RowsSync sync;
+    sync.ro = q8All;
+    sync.roBytes = static_cast<size_t>(M) * in_pad;
+    sync.rw = y;
+    sync.rwStride = out_count;
+    sync.rwRows = M;
+    const uint32_t wrows = out_count - out_count / 2;
+    if (rowsHook_ != nullptr && out_count >= 2 &&
+        static_cast<size_t>(M) * wrows <= rowsStaging_) {
+      rowsHook_(&cq8RowsOuterImpl, &c8, out_count, sync);
+    } else {
+      cq8RowsOuterImpl(&c8, 0, out_count, y, out_count);
+    }
+    fire("buck");
+    for (size_t mm = 0; mm < M; ++mm) {
+      const float s = inv_sqrt * scale[mm];
+      for (uint32_t o = 0; o < out_count; ++o) y[mm * out_count + o] *= s;
+    }
+    return true;
+  }
+#endif
 
   for (uint32_t g = 0; g < groups; ++g) {
     const size_t src = static_cast<size_t>(g) * group;
