@@ -88,6 +88,35 @@ few seconds - 1 to 3 seconds is the range the examples are tuned around. Longer
 clips also take proportionally longer to transcribe (the encoder processes the
 whole utterance at once).
 
+The 5 s cap is a push-to-talk capture limit, not an encoder limit:
+`WhistleEngine::transcribe` accepts longer audio (6.2 s verified), up to about
+8 s, which is where the last full-size stem buffer stops fitting in the PSRAM
+left after the model.
+
+## Performance
+
+Measured on the M5Stack Unit PoE-P4 with 16 kHz mono input:
+
+| spoken audio | default (`decoder_depth` 0) | `decoder_depth` 4 |
+|---|---|---|
+| 1.5 s | 4.7 s | 3.6 s |
+| 3 s | 8.9 s | 7.3 s |
+| 6 s | 18.7 s | 15.8 s |
+
+So expect roughly **3 s of compute per second of speech** at the default depth,
+or about 2.5 s with `decoder_depth = 4`.
+
+- `decoder_depth` (default `0` = all 8 blocks). A rung is a trained sub-network.
+  Changing the option to `4` runs blocks 0, 3, 5, 7. It cuts roughly 15-20% off a
+  transcribe but may cost a little accuracy - on a 1.5 s mid-sentence fragment it
+  changed a word, so validate it on your own commands before shipping.
+
+The bundled examples already compile with `-O2` (their `build_opt.h`); the
+esp32 core otherwise builds at `-Os`, which costs ~10% on this library's float
+loops. `build_opt.h` is read from the sketch folder, so a sketch that uses the
+library directly needs that one line in its own `build_opt.h` to get the same
+speed.
+
 ### Language
 
 The model transcribes in any of its 7 languages and auto-detects the language
