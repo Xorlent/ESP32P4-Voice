@@ -154,37 +154,47 @@ void matmulNT(const float* A, const float* B, float* C, size_t M, size_t N,
   }
 }
 
-// "Monarch"/Kronecker-style apply used by the Hadamard MLP. z is (T, a0*b0)
-// laid out so z.reshape(-1, a0, b0)[i,j]; out is (T, a1*b1) with
-// out[k,l] = sum_{i,j} z[i,j] * a[i,k] * b[j,l]. a0*a1 == b0*b1 == nn. Matrix
-// dimensions come from the actual factor tensors (16/32 for whistle, 32/32 for
-// needle), so this must remain generic.
-//
-// Implemented as (A (x) B) z == B . Z . A^T where Z = z reshaped to (a0, b0):
-//   tmp(j,k) = sum_i Z(i,j) A(i,k)      (b0 x a1)
-//   out(k,l) = sum_j tmp(j,k) B(j,l)    (a1 x b1)
-// O(a0*b0*(a1+b1)) vs the naive O(a0*a1*b0*b1); identical result, but a
-// different summation order (fp32 rounding differs slightly from the naive
-// 4-loop). `scratch` must hold b0*a1 floats.
-void kronApply(const float* z, size_t T, const float* a, uint32_t a0, uint32_t a1,
-               const float* b, uint32_t b0, uint32_t b1, float* out,
-               float* scratch) {
+// Contiguous dot of one row against n_out rows of B, four accumulators to break
+// the FPU dependency chain.
+void dotRows(const float* arow, const float* brow, float* dst, size_t n_out,
+             uint32_t k) {
+  for (size_t o = 0; o < n_out; ++o) {
+    const float* br = brow + o * k;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    uint32_t i = 0;
+    for (; i + 4 <= k; i += 4) {
+      a0 += arow[i] * br[i];
+      a1 += arow[i + 1] * br[i + 1];
+      a2 += arow[i + 2] * br[i + 2];
+      a3 += arow[i + 3] * br[i + 3];
+    }
+    float acc = (a0 + a1) + (a2 + a3);
+    for (; i < k; ++i) acc += arow[i] * br[i];
+    dst[o] = acc;
+  }
+}
+
+// out[k,l] = sum_{i,j} z[i,j] * a[i,k] * b[j,l]. aT is a transposed
+// (a1 x a0) and bT is (b1 x b0), so both passes read contiguous memory.
+// scratch holds a1*b0 + a0*b0 floats.
+void kronApply(const float* z, size_t T, const float* aT, uint32_t a0,
+               uint32_t a1, const float* bT, uint32_t b0, uint32_t b1,
+               float* out, float* scratch) {
+  float* tmpT = scratch;
+  float* zT = scratch + static_cast<size_t>(a1) * b0;
   for (size_t t = 0; t < T; ++t) {
     const float* zt = z + t * (a0 * b0);
     float* ot = out + t * (a1 * b1);
-    float* tmp = scratch;
-    for (uint32_t j = 0; j < b0; ++j)
-      for (uint32_t k = 0; k < a1; ++k) {
-        float acc = 0.0f;
-        for (uint32_t i = 0; i < a0; ++i) acc += zt[i * b0 + j] * a[i * a1 + k];
-        tmp[j * a1 + k] = acc;
-      }
+    for (uint32_t i = 0; i < a0; ++i)
+      for (uint32_t j = 0; j < b0; ++j)
+        zT[static_cast<size_t>(j) * a0 + i] =
+            zt[static_cast<size_t>(i) * b0 + j];
     for (uint32_t k = 0; k < a1; ++k)
-      for (uint32_t l = 0; l < b1; ++l) {
-        float acc = 0.0f;
-        for (uint32_t j = 0; j < b0; ++j) acc += tmp[j * a1 + k] * b[j * b1 + l];
-        ot[k * b1 + l] = acc;
-      }
+      dotRows(aT + static_cast<size_t>(k) * a0, zT,
+              tmpT + static_cast<size_t>(k) * b0, b0, a0);
+    for (uint32_t k = 0; k < a1; ++k)
+      dotRows(tmpT + static_cast<size_t>(k) * b0, bT,
+              ot + static_cast<size_t>(k) * b1, b1, b0);
   }
 }
 
@@ -217,10 +227,6 @@ const float* Decoder::tensor(const char* name, size_t* elements) const {
   return cachedTensor(name, elements);
 }
 
-void Decoder::evictRange(int begin, int end) const {
-  for (int i = begin; i < end; ++i) cache_.erase(i);
-}
-
 bool Decoder::forward(const int32_t* tokens, size_t T, float* logits) const {
   return forwardImpl(tokens, T, nullptr, 0, nullptr, logits, -1);
 }
@@ -240,7 +246,10 @@ void Decoder::dropCrossKv() const {
 
 uint32_t Decoder::prepareCrossAttention(const float* mem, size_t S,
                                         const AudioLayout& layout) const {
-  for (auto& e : crossKv_) e.valid = false;
+  for (auto& e : crossKv_) {
+    e.valid = false;
+    e.floatReady = false;
+  }
   if (mem == nullptr || S == 0) return 0;
 
   const ModelGeometry& g = weights_.geometry();
@@ -547,12 +556,6 @@ bool Decoder::forwardImpl(const int32_t* tokens, size_t T, const float* mem,
     std::memcpy(ev.data() + s * T * d, evconv.data(), T * d * sizeof(float));
   }
 
-  if (bounded_) {
-    // engram 0..S key/value projections are no longer needed (ek/ev are held).
-    const int engram_base = 1 + static_cast<int>(Lfull) * 27 + 11;
-    evictRange(engram_base, engram_base + static_cast<int>(S) * 4);
-  }
-
   if (captureDebug && !inc) {
     dbgEk = ek;
     dbgEv = ev;
@@ -561,14 +564,21 @@ bool Decoder::forwardImpl(const int32_t* tokens, size_t T, const float* mem,
 
   // ---- RoPE tables (T x half_qk) ----
   const float theta = g.rope_theta;
+  if (ropeQk_ != qk || ropeTheta_ != theta) {
+    scratch_.ropeFreq.resize(half_qk);
+    for (uint32_t j = 0; j < half_qk; ++j)
+      scratch_.ropeFreq[j] =
+          1.0f / std::pow(theta, (2.0f * j) / static_cast<float>(qk));
+    ropeQk_ = qk;
+    ropeTheta_ = theta;
+  }
   scratch_.cos_t.assign(T * half_qk, 0.0f);
   scratch_.sin_t.assign(T * half_qk, 0.0f);
   auto& cos_t = scratch_.cos_t;
   auto& sin_t = scratch_.sin_t;
   for (size_t t = 0; t < T; ++t) {
     for (uint32_t j = 0; j < half_qk; ++j) {
-      const float freq = 1.0f / std::pow(theta, (2.0f * j) / static_cast<float>(qk));
-      const float a = static_cast<float>(tbase + t) * freq;
+      const float a = static_cast<float>(tbase + t) * scratch_.ropeFreq[j];
       cos_t[t * half_qk + j] = std::cos(a);
       sin_t[t * half_qk + j] = std::sin(a);
     }
@@ -899,30 +909,42 @@ bool Decoder::forwardImpl(const int32_t* tokens, size_t T, const float* mem,
     std::snprintf(nm, sizeof nm, "l%u.d4", layer); const float* d4 = cachedTensor(nm, nullptr);
     std::snprintf(nm, sizeof nm, "l%u.cond_v", layer); const float* cond_v = cachedTensor(nm, nullptr);
     std::snprintf(nm, sizeof nm, "l%u.cond_u", layer); const float* cond_u = cachedTensor(nm, nullptr);
-    std::snprintf(nm, sizeof nm, "l%u.w1a", layer); const float* w1a = cachedTensor(nm, nullptr);
-    std::snprintf(nm, sizeof nm, "l%u.w1b", layer); const float* w1b = cachedTensor(nm, nullptr);
-    std::snprintf(nm, sizeof nm, "l%u.w2a", layer); const float* w2a = cachedTensor(nm, nullptr);
-    std::snprintf(nm, sizeof nm, "l%u.w2b", layer); const float* w2b = cachedTensor(nm, nullptr);
-    std::snprintf(nm, sizeof nm, "l%u.w3a", layer); const float* w3a = cachedTensor(nm, nullptr);
-    std::snprintf(nm, sizeof nm, "l%u.w3b", layer); const float* w3b = cachedTensor(nm, nullptr);
-
-    // Factor matrix dims (16x16 / 32x32 for whistle; 32x32 / 32x32 for needle).
-    std::snprintf(nm, sizeof nm, "l%u.w1a", layer); const cactus::TensorMeta* m1a = weights_.meta(nm);
-    std::snprintf(nm, sizeof nm, "l%u.w1b", layer); const cactus::TensorMeta* m1b = weights_.meta(nm);
-    std::snprintf(nm, sizeof nm, "l%u.w2a", layer); const cactus::TensorMeta* m2a = weights_.meta(nm);
-    std::snprintf(nm, sizeof nm, "l%u.w2b", layer); const cactus::TensorMeta* m2b = weights_.meta(nm);
-    std::snprintf(nm, sizeof nm, "l%u.w3a", layer); const cactus::TensorMeta* m3a = weights_.meta(nm);
-    std::snprintf(nm, sizeof nm, "l%u.w3b", layer); const cactus::TensorMeta* m3b = weights_.meta(nm);
-    if (!m1a || !m1b || !m2a || !m2b || !m3a || !m3b) return;
-    const uint32_t w1a0 = m1a->shape[0], w1a1 = m1a->shape[1];
-    const uint32_t w1b0 = m1b->shape[0], w1b1 = m1b->shape[1];
-    const uint32_t w2a0 = m2a->shape[0], w2a1 = m2a->shape[1];
-    const uint32_t w2b0 = m2b->shape[0], w2b1 = m2b->shape[1];
-    const uint32_t w3a0 = m3a->shape[0], w3a1 = m3a->shape[1];
-    const uint32_t w3b0 = m3b->shape[0], w3b1 = m3b->shape[1];
-    const size_t kscratch_need = std::max(w1b0 * w1a1,
-        std::max(w2b0 * w2a1, w3b0 * w3a1));
-    if (kronScratch.size() < kscratch_need) kronScratch.resize(kscratch_need);
+    // Transposed factor matrices are model constants, cached across steps instead
+    // of being dequantized and retransposed at every block and every step.
+    if (!hadaLoaded_) {
+      for (uint32_t i = 0; i < 3; ++i) {
+        hadaW_[i].resize(Lfull);
+        for (uint32_t l = 0; l < Lfull; ++l) {
+          std::snprintf(nm, sizeof nm, "l%u.w%ua", l, i + 1);
+          const float* a = cachedTensor(nm, nullptr);
+          const cactus::TensorMeta* ma = weights_.meta(nm);
+          std::snprintf(nm, sizeof nm, "l%u.w%ub", l, i + 1);
+          const float* b = cachedTensor(nm, nullptr);
+          const cactus::TensorMeta* mb = weights_.meta(nm);
+          if (!a || !b || !ma || !mb) return;
+          KronFactors& f = hadaW_[i][l];
+          f.a0 = ma->shape[0];
+          f.a1 = ma->shape[1];
+          f.b0 = mb->shape[0];
+          f.b1 = mb->shape[1];
+          f.aT.resize(static_cast<size_t>(f.a0) * f.a1);
+          f.bT.resize(static_cast<size_t>(f.b0) * f.b1);
+          for (uint32_t r = 0; r < f.a0; ++r)
+            for (uint32_t c = 0; c < f.a1; ++c)
+              f.aT[c * f.a0 + r] = a[r * f.a1 + c];
+          for (uint32_t r = 0; r < f.b0; ++r)
+            for (uint32_t c = 0; c < f.b1; ++c)
+              f.bT[c * f.b0 + r] = b[r * f.b1 + c];
+        }
+      }
+      hadaLoaded_ = true;
+    }
+    const KronFactors& k1 = hadaW_[0][layer];
+    const KronFactors& k2 = hadaW_[1][layer];
+    const KronFactors& k3 = hadaW_[2][layer];
+    const size_t kscratch_need = std::max(k1.b0 * k1.a1,
+        std::max(k2.b0 * k2.a1, k3.b0 * k3.a1));
+    if (kronScratch.size() < kscratch_need + nn) kronScratch.resize(kscratch_need + nn);
     float* kscratch = kronScratch.data();
 
     scratch_.xc.assign(T * 8, 0.0f);
@@ -955,18 +977,23 @@ bool Decoder::forwardImpl(const int32_t* tokens, size_t T, const float* mem,
       std::memcpy(z.data() + t * nn, xin + t * d, d * sizeof(float));
       std::memset(z.data() + t * nn + d, 0, (nn - d) * sizeof(float));
     }
-    for (size_t i = 0; i < T * nn; ++i) z[i] *= d1[i % nn];
-    kronApply(z.data(), T, w1a, w1a0, w1a1, w1b, w1b0, w1b1, ztmp.data(), kscratch);
+    for (size_t t = 0; t < T; ++t)
+      for (uint32_t c = 0; c < nn; ++c) z[t * nn + c] *= d1[c];
+    kronApply(z.data(), T, k1.aT.data(), k1.a0, k1.a1, k1.bT.data(), k1.b0,
+              k1.b1, ztmp.data(), kscratch);
     for (size_t t = 0; t < T; ++t)
       for (uint32_t c = 0; c < nn; ++c) z[t * nn + c] = ztmp[t * nn + p1[c]];
     for (size_t t = 0; t < T; ++t)
       for (uint32_t c = 0; c < nn; ++c)
         z[t * nn + c] = silu(d2[c] * cond[t * nn + c] * z[t * nn + c] + b2[c]);
-    kronApply(z.data(), T, w2a, w2a0, w2a1, w2b, w2b0, w2b1, ztmp.data(), kscratch);
+    kronApply(z.data(), T, k2.aT.data(), k2.a0, k2.a1, k2.bT.data(), k2.b0,
+              k2.b1, ztmp.data(), kscratch);
     for (size_t t = 0; t < T; ++t)
       for (uint32_t c = 0; c < nn; ++c) z[t * nn + c] = ztmp[t * nn + p2[c]];
-    for (size_t i = 0; i < T * nn; ++i) z[i] *= d3[i % nn];
-    kronApply(z.data(), T, w3a, w3a0, w3a1, w3b, w3b0, w3b1, ztmp.data(), kscratch);
+    for (size_t t = 0; t < T; ++t)
+      for (uint32_t c = 0; c < nn; ++c) z[t * nn + c] *= d3[c];
+    kronApply(z.data(), T, k3.aT.data(), k3.a0, k3.a1, k3.bT.data(), k3.b0,
+              k3.b1, ztmp.data(), kscratch);
     for (size_t t = 0; t < T; ++t)
       for (uint32_t c = 0; c < d; ++c) hout[t * d + c] = d4[c] * ztmp[t * nn + c];
   };
@@ -983,9 +1010,15 @@ bool Decoder::forwardImpl(const int32_t* tokens, size_t T, const float* mem,
     auto& q = scratch_.c_q;
     q.resize(T * H * qk);
     auto& k = scratch_.c_k;
-    k.resize(memS * H * qk);
     auto& v = scratch_.c_v;
-    v.resize(memS * H * vd);
+    const float* kp = k.data();
+    const float* vp = v.data();
+    if (!cached) {
+      k.resize(memS * H * qk);
+      v.resize(memS * H * vd);
+      kp = k.data();
+      vp = v.data();
+    }
     auto& qn = scratch_.c_qn;
     qn.resize(qk);
     auto& kn = scratch_.c_kn;
@@ -1021,19 +1054,25 @@ bool Decoder::forwardImpl(const int32_t* tokens, size_t T, const float* mem,
     }
 
     if (cached) {
-      // K/V were projected and normed once per utterance; only dequantize.
-      const CrossKv& e = crossKv_[layer];
-      for (size_t s = 0; s < memS; ++s)
-        for (uint32_t h = 0; h < H; ++h) {
-          const float ks = e.kscale[s * H + h];
-          const int8_t* kc = e.k.data() + (s * H + h) * qk;
-          float* krow = k.data() + (s * H + h) * qk;
-          for (uint32_t c = 0; c < qk; ++c) krow[c] = kc[c] * ks;
-          const float vs = e.vscale[s * H + h];
-          const int8_t* vc = e.v.data() + (s * H + h) * vd;
-          float* vrow = v.data() + (s * H + h) * vd;
-          for (uint32_t c = 0; c < vd; ++c) vrow[c] = vc[c] * vs;
-        }
+      CrossKv& e = crossKv_[layer];
+      if (!e.floatReady) {
+        e.kf.resize(memS * H * qk);
+        e.vf.resize(memS * H * vd);
+        for (size_t s = 0; s < memS; ++s)
+          for (uint32_t h = 0; h < H; ++h) {
+            const float ks = e.kscale[s * H + h];
+            const int8_t* kc = e.k.data() + (s * H + h) * qk;
+            float* krow = e.kf.data() + (s * H + h) * qk;
+            for (uint32_t c = 0; c < qk; ++c) krow[c] = kc[c] * ks;
+            const float vs = e.vscale[s * H + h];
+            const int8_t* vc = e.v.data() + (s * H + h) * vd;
+            float* vrow = e.vf.data() + (s * H + h) * vd;
+            for (uint32_t c = 0; c < vd; ++c) vrow[c] = vc[c] * vs;
+          }
+        e.floatReady = true;
+      }
+      kp = e.kf.data();
+      vp = e.vf.data();
     } else {
       fakeQuantQ8(mem, memS, d, mem8.data(), mscale.data());
       if (!weights_.gemvCqInt8Index(audio->crossIndex(layer, 2), 0, H * qk,
@@ -1074,7 +1113,7 @@ bool Decoder::forwardImpl(const int32_t* tokens, size_t T, const float* mem,
         const float* qrow = q.data() + (t * H + h) * qk;
         float maxs = -INFINITY;
         for (size_t s = 0; s < memS; ++s) {
-          const float* krow = k.data() + (s * H + h) * qk;
+          const float* krow = kp + (s * H + h) * qk;
           float acc = 0.0f;
           for (uint32_t c = 0; c < qk; ++c) acc += qrow[c] * krow[c];
           sc[s] = acc * invSqrtQk;
@@ -1092,7 +1131,7 @@ bool Decoder::forwardImpl(const int32_t* tokens, size_t T, const float* mem,
         for (uint32_t c = 0; c < vd; ++c) ohrow[c] = 0.0f;
         for (size_t s = 0; s < memS; ++s) {
           const float w = pr[s];
-          const float* vrow = v.data() + (s * H + h) * vd;
+          const float* vrow = vp + (s * H + h) * vd;
           for (uint32_t c = 0; c < vd; ++c) ohrow[c] += w * vrow[c];
         }
       }
@@ -1298,12 +1337,9 @@ bool Decoder::forwardImpl(const int32_t* tokens, size_t T, const float* mem,
       }
 
     block(u.data(), layer, site_flags.data() + static_cast<size_t>(layer) * S, blk.data());
-    if (bounded_) {
-      // This layer's 27 tensors (q/k/v proj, taps, norms, gate/out, hadamard
-      // factors, etc.) are consumed; drop them before the next layer.
-      evictRange(1 + static_cast<int>(layer) * 27,
-                 1 + static_cast<int>(layer) * 27 + 27);
-    }
+    // The CQ projections never enter cache_; the tensors that do (norms,
+    // diagonals, conditioner) are small. Keeping them across steps avoids
+    // dequantizing the same constants on every token.
     for (size_t i = 0; i < T * d; ++i) y[i] = blk[i] - u[i];
 
     if (int8_) {

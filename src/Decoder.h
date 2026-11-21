@@ -39,11 +39,9 @@ class Decoder {
   // Dequantizes the named tensor (cached). Returns nullptr on failure.
   const float* tensor(const char* name, size_t* elements) const;
 
-  // When on, forward() avoids materializing the fp32 embedding (rows fetched on
-  // demand, output head streamed) and evicts per-layer tensors from the dequant
-  // cache once used. Keeps peak dequant memory within roughly one layer + the
-  // shared hyper-connection tensors, so a full forward fits the ~15 MB of PSRAM
-  // left after staging whistle.cact. Produces bit-identical logits.
+  // When on, forward() avoids materializing the fp32 embedding and output head
+  // (rows fetched on demand), so a full forward fits in the PSRAM left after
+  // staging whistle.cact. Small per-layer tensors stay cached across steps.
   void setBounded(bool b) { bounded_ = b; }
   bool bounded() const { return bounded_; }
 
@@ -114,13 +112,16 @@ class Decoder {
   bool int8_ = false;
   uint32_t depth_ = 0;
 
-  // Post-norm, post-quantization cross-attention K/V for one block: one row per
-  // memory frame and head, so the per-step gate only has to dequantize.
+  // Post-norm, post-quantization cross-attention K/V for one block. The float
+  // copies are prepared on first use and reused for the utterance's steps.
   struct CrossKv {
     bool valid = false;
+    bool floatReady = false;
     size_t memS = 0;
     std::vector<int8_t> k, v;
     std::vector<float> kscale, vscale;
+    // Dequantized copies are reused across greedy steps, not rebuilt per step.
+    std::vector<float> kf, vf;
   };
   mutable std::vector<CrossKv> crossKv_;
 
@@ -148,7 +149,7 @@ class Decoder {
   // per-step greedy calls instead of re-allocating each call.
   struct Scratch {
     std::vector<float> x, erow, ngramOk, ek, ev, featch, kk, vv, evconv;
-    std::vector<float> cos_t, sin_t;
+    std::vector<float> cos_t, sin_t, ropeFreq;
     std::vector<float> xq, qflat, qconv, kflat, kconv, vflat, vconv;
     std::vector<float> qhead, khead, vhead, scores, attn, oh, atmp, gate, ztmp;
     std::vector<float> xc, cond, z, bx, resid, hn, at, hn2, hmo;
@@ -167,8 +168,16 @@ class Decoder {
   };
   mutable Scratch scratch_;
 
+  struct KronFactors {
+    uint32_t a0 = 0, a1 = 0, b0 = 0, b1 = 0;
+    std::vector<float> aT, bT;
+  };
+  mutable std::vector<KronFactors> hadaW_[3];
+  mutable bool hadaLoaded_ = false;
+  mutable uint32_t ropeQk_ = 0;
+  mutable float ropeTheta_ = 0.0f;
+
   const float* cachedTensor(const char* name, size_t* elements) const;
-  void evictRange(int begin, int end) const;
 };
 
 }  // namespace whistle

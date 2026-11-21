@@ -211,9 +211,11 @@ void cq8RowsImpl(void* vp, uint32_t r0, uint32_t r1, float* out,
       for (uint32_t b = 0; b < nbytes; ++b)
         reinterpret_cast<uint32_t*>(wq + 4 * b)[0] = c.tab2[gidx[b]];
     } else {
-      const uint32_t nbytes = c.group >> 1;
-      for (uint32_t b = 0; b < nbytes; ++b)
-        reinterpret_cast<uint16_t*>(wq + 2 * b)[0] = c.tab4[gidx[b]];
+      const uint32_t pairs = c.group >> 2;
+      for (uint32_t b = 0; b < pairs; ++b)
+        reinterpret_cast<uint32_t*>(wq + 4 * b)[0] =
+            static_cast<uint32_t>(c.tab4[gidx[2 * b]]) |
+            (static_cast<uint32_t>(c.tab4[gidx[2 * b + 1]]) << 16);
     }
     for (size_t mm = 0; mm < c.M; ++mm) {
       const int32_t d = kernels::dot_s8(wq, c.xq + mm * c.group, c.group);
@@ -264,9 +266,11 @@ void cq8RowsOuterImpl(void* vp, uint32_t r0, uint32_t r1, float* out,
         for (uint32_t b = 0; b < nbytes; ++b)
           reinterpret_cast<uint32_t*>(wq + 4 * b)[0] = c.tab2[gidx[b]];
       } else {
-        const uint32_t nbytes = c.group >> 1;
-        for (uint32_t b = 0; b < nbytes; ++b)
-          reinterpret_cast<uint16_t*>(wq + 2 * b)[0] = c.tab4[gidx[b]];
+        const uint32_t pairs = c.group >> 2;
+        for (uint32_t b = 0; b < pairs; ++b)
+          reinterpret_cast<uint32_t*>(wq + 4 * b)[0] =
+              static_cast<uint32_t>(c.tab4[gidx[2 * b]]) |
+              (static_cast<uint32_t>(c.tab4[gidx[2 * b + 1]]) << 16);
       }
       const size_t gbase = static_cast<size_t>(g) * c.group;
       for (size_t mm = 0; mm < c.M; ++mm) {

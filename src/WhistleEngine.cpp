@@ -143,20 +143,19 @@ bool WhistleEngine::transcribe(const float* pcm, size_t num_samples,
       progress_(progress_udata_, tag);
     }
 
-    logits.assign(T * vocab, 0.0f);
     bool fwd = false;
     if (useInc) {
-      // forwardStep writes the single new row; place it where the batched path
-      // would put the last prefix row.
+      // A step writes only its own last logits row, not the whole prefix.
+      if (logits.size() != vocab) logits.resize(vocab);
       fwd = decoder_.forwardStep(tokens.data(), T, mem.data(), frames,
-                                 audio_layout_,
-                                 logits.data() + (T - 1) * vocab);
+                                 audio_layout_, logits.data());
       if (!fwd) {
         decoder_.endSequence();
         useInc = false;
       }
     }
     if (!useInc) {
+      if (logits.size() != T * vocab) logits.resize(T * vocab);
       fwd = decoder_.forwardWithMemory(tokens.data(), T, mem.data(), frames,
                                        audio_layout_, logits.data(),
                                        static_cast<int32_t>(T - 1));
@@ -174,7 +173,7 @@ bool WhistleEngine::transcribe(const float* pcm, size_t num_samples,
       if (decoder_.forwardWithMemory(tokens.data(), T, mem.data(), frames,
                                      audio_layout_, ref.data(),
                                      static_cast<int32_t>(T - 1))) {
-        const float* a = logits.data() + (T - 1) * vocab;
+        const float* a = useInc ? logits.data() : logits.data() + (T - 1) * vocab;
         const float* b = ref.data() + (T - 1) * vocab;
         float maxd = 0.0f;
         uint32_t ia = 0;
@@ -189,7 +188,7 @@ bool WhistleEngine::transcribe(const float* pcm, size_t num_samples,
         if (ia != ib) ++verify_mismatch_;
       }
     }
-    const float* last = logits.data() + (T - 1) * vocab;
+    const float* last = useInc ? logits.data() : logits.data() + (T - 1) * vocab;
     int32_t best;
     if (T == 1 && lang_ < 7) {
       // Forced language hint: the 7 language tokens immediately follow the text

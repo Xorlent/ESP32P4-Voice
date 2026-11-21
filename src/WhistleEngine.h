@@ -79,8 +79,8 @@ class WhistleEngine {
   const cactus::CactArchive& archive() const { return archive_; }
   const Decoder& decoder() const { return decoder_; }
 
-  // Enables the memory-bounded decoder (embedding streamed, per-layer eviction),
-  // required to fit a forward in the PSRAM left after staging the model.
+  // Streams the large embedding rows instead of materializing them, required to
+  // fit a forward in the PSRAM left after staging the model.
   void setBounded(bool b) { decoder_.setBounded(b); }
   bool bounded() const { return decoder_.bounded(); }
 
